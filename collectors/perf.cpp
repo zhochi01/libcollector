@@ -1,23 +1,18 @@
 #include "perf.hpp"
 
 #include <errno.h>
-#include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
-#include <string.h>
+#include <asm/unistd.h>
+#include <sys/types.h>
+#include <pthread.h>
+#include <sstream>
 #include <sys/ioctl.h>
-#include <sys/syscall.h>
 #if !defined(ANDROID)
 #include <linux/perf_event.h>
 #else
 #include "perf_event.h"
 #endif
-#include <asm/unistd.h>
-#include <sys/types.h>
-#include <dirent.h>
-#include <pthread.h>
-#include <sstream>
-#include <fstream>
 
 static std::map<int, std::vector<struct event>> EVENTS = {
 {0, { {"CPUInstructionRetired", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS, false, false, hw_cnt_length::b32, false},
@@ -79,14 +74,33 @@ static inline uint64_t makeup_booker_ci_config(int nodetype, int eventid, int by
     return config;
 }
 
-PerfCollector::PerfCollector(const Json::Value& config, const std::string& name) : Collector(config, name)
+PerfCollector::PerfCollector(const Json::Value& config, const std::string& name, bool enablePerapiPerf) : Collector(config, name), mEnablePerapiPerf(enablePerapiPerf)
 {
-    struct event leader = {"CPUCycleCount", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES};
 
+    struct event leader;
+    if (mEnablePerapiPerf)
+    {
+        volatile uint64_t pmcr_el0;
+        asm volatile("mrs %0, PMCR_EL0" : "=r"(pmcr_el0));
+        pmu_counter_bits = ((pmcr_el0 & 0x80) == 0x80 ? 64 : 32);
+        if (!mConfig.isMember("type")) exit(EXIT_FAILURE);
+
+        DBG_LOG("pmu counter bits are: %u\n", pmu_counter_bits);
+        DBG_LOG("pmcr_el0 is: %lu\n", pmcr_el0);
+
+        leader = {"CPUCycleCount", mConfig.get("type", 8).asUInt(), 0x0011, false, false, pmu_counter_bits == 64 ? hw_cnt_length::b64 : hw_cnt_length::b32, false};
+    }
+    else
+    {
+        leader = {"CPUCycleCount", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES};
+    }
+
+    if (mEnablePerapiPerf) mAllThread = false;
     mSet = mConfig.get("set", -1).asInt();
-    mInherit = mConfig.get("inherit", 1).asInt();
+    mInherit = mConfig.get("inherit", 0).asInt();
 
     leader.inherited = mInherit;
+    leader.cspmu = false;
     mEvents.push_back(leader);
 
     if ((0 <= mSet) && (mSet <= 3))
@@ -193,7 +207,7 @@ PerfCollector::PerfCollector(const Json::Value& config, const std::string& name)
         }
     }
 
-    mAllThread = mConfig.get("allthread", true).asBool();
+    mAllThread = mConfig.get("allthread", !mEnablePerapiPerf).asBool();
 }
 
 static inline long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
@@ -246,9 +260,17 @@ bool PerfCollector::init()
     for (perf_thread& t : mReplayThreads)
     {
         t.eventCtx.init(mEvents, t.tid, -1);
+        if (mEnablePerapiPerf)
+        {
+            t.eventCtx.setEnablePerApi();
+        }
         for (auto& et : mMultiPMUEvents)
         {
             mMultiPMUThreads[i].eventCtx.init(et.second, mMultiPMUThreads[i].tid, -1);
+            if (mEnablePerapiPerf)
+            {
+                mMultiPMUThreads[i].eventCtx.setEnablePerApi();
+            }
             i++;
         }
     }
@@ -443,36 +465,7 @@ bool PerfCollector::collect(int64_t now)
     return true;
 }
 
-bool PerfCollector::perf_counter_pause() {
-#if defined(__aarch64__)
-    asm volatile("mrs %0, PMCNTENSET_EL0" : "=r" (PMCNTENSET_EL0_safe));
-    // stop counters for arm64
-    asm volatile("mrs %0, PMCR_EL0" : "=r" (PMCR_EL0_safe));
-    asm volatile("msr PMCR_EL0, %0" : : "r" (PMCR_EL0_safe & 0xFFFFFFFFFFFFFFFE));
-#elif defined(__arm__)
-    asm volatile("mrc p15, 0, %0, c9, c12, 1" : "=r"(PMCNTENSET_EL0_safe));
-    // stop counters for arm32
-    asm volatile("mrc p15, 0, %0, c9, c12, 0" : "=r"(PMCR_EL0_safe));
-    asm volatile("mcr p15, 0, %0, c9, c12, 0" : : "r"(PMCR_EL0_safe & 0xFFFFFFFE));
-#endif
-    return true;
-}
-
-bool PerfCollector::perf_counter_resume() {
-#if defined(__aarch64__)
-    // start counters for arm64
-    asm volatile("msr PMCNTENSET_EL0, %0" : : "r" (PMCNTENSET_EL0_safe));
-    asm volatile("msr PMCR_EL0, %0" : : "r" (PMCR_EL0_safe));
-#elif defined(__arm__)
-    // start counters for arm32
-    asm volatile("mcr p15, 0, %0, c9, c12, 1" : : "r"(PMCNTENSET_EL0_safe));
-    asm volatile("mcr p15, 0, %0, c9, c12, 0" : : "r"(PMCR_EL0_safe));
-#endif
-    return true;
-}
-
-
-bool PerfCollector::collect_scope_start(int64_t now, uint16_t func_id, int32_t flags) {
+bool PerfCollector::collect_scope_start(uint16_t func_id, int32_t flags, int tid) {
 #if defined(__x86_64__)
     if (!attempt_collect_scope_x64) {
         attempt_collect_scope_x64 = true;
@@ -480,51 +473,17 @@ bool PerfCollector::collect_scope_start(int64_t now, uint16_t func_id, int32_t f
                 "significant overhead to the kernel perf counter data.\n");
     }
 #endif
-    if (!perf_counter_pause()) return false;
     if (!mCollecting) return false;
     struct snapshot snap;
     if (flags & COLLECT_REPLAY_THREADS || flags & COLLECT_ALL_THREADS)
     {
-        for (perf_thread &t : mReplayThreads)
-        {
-            t.eventCtx.collect_scope(now, func_id, false);
-        }
-    }
-    if (flags & COLLECT_BG_THREADS || flags & COLLECT_ALL_THREADS)
-    {
-        for (perf_thread &t : mBgThreads)
-        {
-            t.eventCtx.collect_scope(now, func_id, false);
-        }
-    }
-    if (flags & COLLECT_MULTI_PMU_THREADS || flags & COLLECT_ALL_THREADS)
-    {
-        for (perf_thread &t : mMultiPMUThreads)
-        {
-            t.eventCtx.collect_scope(now, func_id, false);
-        }
-    }
-    if (flags & COLLECT_BOOKER_THREADS || flags & COLLECT_ALL_THREADS)
-    {
-        for (perf_thread &t : mBookerThread)
-        {
-            t.eventCtx.collect_scope(now, func_id, false);
-        }
-    }
-    if (flags & COLLECT_CSPMU_THREADS || flags & COLLECT_ALL_THREADS)
-    {
-        for (perf_thread &t : mCSPMUThreads)
-        {
-            t.eventCtx.collect_scope(now, func_id, false);
-        }
+        mReplayThreads[tid].eventCtx.collect_scope(func_id, false, get_pmu_bits());
     }
     last_collect_scope_flags = flags;
-    if (!perf_counter_resume()) return false;
     return true;
 }
 
-bool PerfCollector::collect_scope_stop(int64_t now, uint16_t func_id, int32_t flags) {
-    if (!perf_counter_pause()) return false;
+bool PerfCollector::collect_scope_stop(uint16_t func_id, int32_t flags, int tid) {
     if (!mCollecting) return false;
     if (last_collect_scope_flags != flags) {
         DBG_LOG("Error: Could not find the corresponding collect_scope_start call for func_id %ud.\n", func_id);
@@ -533,51 +492,11 @@ bool PerfCollector::collect_scope_stop(int64_t now, uint16_t func_id, int32_t fl
     struct snapshot snap_start, snap_stop;
     if (flags & COLLECT_REPLAY_THREADS || flags & COLLECT_ALL_THREADS)
     {
-        for (perf_thread &t : mReplayThreads)
-        {
-            snap_start = t.eventCtx.last_snap;
-            snap_stop = t.eventCtx.collect_scope(now, func_id, true);
-            t.update_data_scope(func_id, snap_start, snap_stop);
-        }
+        snap_start = mReplayThreads[tid].eventCtx.last_snap;
+        snap_stop = mReplayThreads[tid].eventCtx.collect_scope(func_id, true, get_pmu_bits());
+        mReplayThreads[tid].update_data_scope(func_id, snap_start, snap_stop);
     }
-    if (flags & COLLECT_BG_THREADS || flags & COLLECT_ALL_THREADS)
-    {
-        for (perf_thread &t : mBgThreads)
-        {
-            snap_start = t.eventCtx.last_snap;
-            snap_stop = t.eventCtx.collect_scope(now, func_id, true);
-            t.update_data_scope(func_id, snap_start, snap_stop);
-        }
-    }
-    if (flags & COLLECT_MULTI_PMU_THREADS || flags & COLLECT_ALL_THREADS)
-    {
-        for (perf_thread &t : mMultiPMUThreads)
-        {
-            snap_start = t.eventCtx.last_snap;
-            snap_stop = t.eventCtx.collect_scope(now, func_id, true);
-            t.update_data_scope(func_id, snap_start, snap_stop);
-        }
-    }
-    if (flags & COLLECT_BOOKER_THREADS || flags & COLLECT_ALL_THREADS)
-    {
-        for (perf_thread &t : mBookerThread)
-        {
-            snap_start = t.eventCtx.last_snap;
-            snap_stop = t.eventCtx.collect_scope(now, func_id, true);
-            t.update_data_scope(func_id, snap_start, snap_stop);
-        }
-    }
-    if (flags & COLLECT_CSPMU_THREADS || flags & COLLECT_ALL_THREADS)
-    {
-        for (perf_thread &t : mCSPMUThreads)
-        {
-            snap_start = t.eventCtx.last_snap;
-            snap_stop = t.eventCtx.collect_scope(now, func_id, true);
-            t.update_data_scope(func_id, snap_start, snap_stop);
-        }
-    }
-    if (!perf_counter_resume()) return false;
-    return false;
+    return true;
 }
 
 bool PerfCollector::postprocess(const std::vector<int64_t>& timing)
@@ -698,6 +617,7 @@ void PerfCollector::summarize()
 bool event_context::init(std::vector<struct event> &events, int tid, int cpu)
 {
     struct counter grp;
+    grp.name = "CPUCycleCount";
     grp.fd = group = add_event(events[0], tid, cpu);
     grp.name = events[0].name;
     mCounters.push_back(grp);
@@ -727,6 +647,15 @@ bool event_context::deinit()
     return true;
 }
 
+
+#define F_BIT_0 ((uint32_t)0x00000001)
+#define F_BIT_2 ((uint32_t)0x00000004)
+#define F_BIT_3 ((uint32_t)0x00000008)
+#define CINSTRP_ARMV8_PMCR_E ((unsigned long long)F_BIT_0) /* Enable all counters */
+#define CINSTRP_ARMV8_PMCR_C ((unsigned long long)F_BIT_2) /* Cycle counter reset */
+#define CINSTRP_ARMV8_PMCR_R ((unsigned long long)F_BIT_3) /* Cycle counter reset */
+
+
 bool event_context::start()
 {
     if (ioctl(group, PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP) == -1)
@@ -739,6 +668,18 @@ bool event_context::start()
         perror("ioctl PERF_EVENT_IOC_ENABLE");
         return false;
     }
+
+    if (getEnablePerApi())
+    {
+        volatile uint64_t pmuserenr_el0 = 0;
+        asm volatile("mrs %0, PMUSERENR_EL0" : "=r"(pmuserenr_el0));
+        if ((pmuserenr_el0 & (CINSTRP_ARMV8_PMCR_E | CINSTRP_ARMV8_PMCR_C | CINSTRP_ARMV8_PMCR_R)) != (CINSTRP_ARMV8_PMCR_E | CINSTRP_ARMV8_PMCR_C | CINSTRP_ARMV8_PMCR_R))
+        {
+            DBG_LOG("EL0 access to PMU is required! Please set the appropriate bits in PMUSERENR_EL0. Current settings: %08x\n", (uint32_t)pmuserenr_el0);
+            exit(EXIT_FAILURE);
+        }
+    }
+
     return true;
 }
 
@@ -787,13 +728,21 @@ struct snapshot event_context::collect(int64_t now)
     return snap;
 }
 
-struct snapshot event_context::collect_scope(int64_t now, uint16_t func_id, bool stopping)
+struct snapshot event_context::collect_scope(uint16_t func_id, bool stopping, uint8_t pmu_bits)
 {
     if (stopping && last_snap_func_id != func_id) {
         DBG_LOG("Error: Could not find the corresponding collect_scope_start call for func_id %ud.\n", func_id);
+        exit(EXIT_FAILURE);
     }
     struct snapshot snap;
-    if (read(group, &snap, sizeof(snap)) == -1) perror("read");
+    if (pmu_bits == 32)
+    {
+        asm volatile("mrs %0, PMCCNTR_EL0" : "=r"(snap.values[0]));
+    }
+    else
+    {
+        asm volatile("mrs %0, PMEVCNTR2_EL0" : "=r"(snap.values[0]));
+    }
     if (stopping) {
         last_snap_func_id = -1;
     } else {

@@ -348,16 +348,18 @@ private:
               tmp *= rand();
       };
 
+	  pid_t tid = syscall(SYS_gettid);
+
       if (strncmp(thread_name.c_str(), "patrace", 7) == 0) {
-          c->collect_scope_start(0 + scope_label_offset, COLLECT_REPLAY_THREADS);
+          c->collect_scope_start(0 + scope_label_offset, COLLECT_REPLAY_THREADS, tid);
           payload(1000);
-          c->collect_scope_stop(0 + scope_label_offset, COLLECT_REPLAY_THREADS);
+          c->collect_scope_stop(0 + scope_label_offset, COLLECT_REPLAY_THREADS, tid);
       }
 
       if (strncmp(thread_name.c_str(), "mali", 4) == 0) {
-          c->collect_scope_start(1 + scope_label_offset, COLLECT_BG_THREADS);
+          c->collect_scope_start(1 + scope_label_offset, COLLECT_BG_THREADS, tid);
           payload(1000);
-          c->collect_scope_stop(1 + scope_label_offset, COLLECT_BG_THREADS);
+          c->collect_scope_stop(1 + scope_label_offset, COLLECT_BG_THREADS, tid);
       }
       printf("Thread %s finished.\n", thread_name.c_str());
   }
