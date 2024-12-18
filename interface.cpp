@@ -214,10 +214,6 @@ void Collection::init_from_json(const Json::Value& config)
     if (mEnablePerapiPerf)
     {
         mCollectors.push_back(new PerfCollector(config, "perf", true));
-        // volatile uint64_t enable_EL0_access;
-        // asm volatile("mrs %0, PMUSERENR_EL0" : "=r"(enable_EL0_access));
-        // enable_EL0_access |= 1;  // Set the enable bit
-        // asm volatile("msr PMUSERENR_EL0, %0" : : "r"(enable_EL0_access));
     }
     else
     {
@@ -262,7 +258,7 @@ void Collection::init_from_json(const Json::Value& config)
         mCollectors.push_back(new ProcFSStatCollector(config, "procfs"));
         mCollectors.push_back(new MaliCounterCollector(config, "malicounters"));
         // Various specializations
-        // mCollectorMap["battery_temperature"]->doubleTransform(0.1); // divide by 10 and store as float
+        mCollectorMap["battery_temperature"]->doubleTransform(0.1); // divide by 10 and store as float
     }
 #endif
     if (!mEnablePerapiPerf)

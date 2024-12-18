@@ -88,7 +88,7 @@ PerfCollector::PerfCollector(const Json::Value& config, const std::string& name,
         DBG_LOG("pmu counter bits are: %u\n", pmu_counter_bits);
         DBG_LOG("pmcr_el0 is: %lu\n", pmcr_el0);
 
-        leader = {"CPUCycleCount", mConfig.get("type", 8).asUInt(), 0x0011, false, false, pmu_counter_bits == 64 ? hw_cnt_length::b64 : hw_cnt_length::b32, false};
+        leader = {"CPUCycleCount", mConfig.get("type", PERF_TYPE_HARDWARE).asUInt(), 0x0011, false, false, pmu_counter_bits == 64 ? hw_cnt_length::b64 : hw_cnt_length::b32, false};
     }
     else
     {
@@ -477,7 +477,14 @@ bool PerfCollector::collect_scope_start(uint16_t func_id, int32_t flags, int tid
     struct snapshot snap;
     if (flags & COLLECT_REPLAY_THREADS || flags & COLLECT_ALL_THREADS)
     {
-        mReplayThreads[tid].eventCtx.collect_scope(func_id, false, get_pmu_bits());
+        for (auto &thread: mReplayThreads)
+        {
+            size_t start_pos = thread.name.find('-') + 1;
+            if (std::stoi(thread.name.substr(start_pos, thread.name.length() - start_pos)) == tid)
+            {
+                thread.eventCtx.collect_scope(func_id, false, get_pmu_bits());    
+            }
+        }       
     }
     last_collect_scope_flags = flags;
     return true;
@@ -492,9 +499,16 @@ bool PerfCollector::collect_scope_stop(uint16_t func_id, int32_t flags, int tid)
     struct snapshot snap_start, snap_stop;
     if (flags & COLLECT_REPLAY_THREADS || flags & COLLECT_ALL_THREADS)
     {
-        snap_start = mReplayThreads[tid].eventCtx.last_snap;
-        snap_stop = mReplayThreads[tid].eventCtx.collect_scope(func_id, true, get_pmu_bits());
-        mReplayThreads[tid].update_data_scope(func_id, snap_start, snap_stop);
+        for (auto &thread: mReplayThreads)
+        {
+            size_t start_pos = thread.name.find('-') + 1;
+            if (std::stoi(thread.name.substr(start_pos, thread.name.length() - start_pos)) == tid)
+            {
+                snap_start = thread.eventCtx.last_snap;
+                snap_stop = thread.eventCtx.collect_scope(func_id, true, get_pmu_bits());
+                thread.update_data_scope(func_id, snap_start, snap_stop);
+            }
+        }
     }
     return true;
 }
